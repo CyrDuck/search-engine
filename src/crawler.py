@@ -1,269 +1,186 @@
 """
-test_crawler.py - Unit and Integration Tests for the Crawler
+crawler.py - Web Crawler for Search Engine Tool
 XJCO3011 Coursework 2
 
-Tests cover:
-  - URL normalisation
-  - Same-domain filtering
-  - HTML parsing (title, text, links)
-  - Politeness window enforcement
-  - HTTP error handling and retry logic
-  - Full crawl integration (mocked network)
+Crawls https://quotes.toscrape.com/ with a politeness window of 6 seconds.
+Collects page content, metadata, and links for indexing.
 """
 
-import sys
 import time
-from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+from urllib.parse import urljoin, urlparse
 
-import pytest
+import requests
+from bs4 import BeautifulSoup
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
-from crawler import Crawler, PageData
-
-
-# ── Fixtures ──────────────────────────────────────────────────────────────────
-
-SAMPLE_HTML = """
-<html>
-  <head><title>Test Page</title></head>
-  <body>
-    <p>Hello world, this is a test page.</p>
-    <a href="/page2">Page 2</a>
-    <a href="https://external.example.com/page">External</a>
-    <a href="/page3#section">Page 3 with fragment</a>
-  </body>
-</html>
-"""
-
-SAMPLE_HTML_NO_TITLE = """
-<html>
-  <body><p>No title here.</p></body>
-</html>
-"""
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
 
-@pytest.fixture
-def crawler():
-    """Return a Crawler with a short politeness window for testing."""
-    return Crawler(base_url="https://quotes.toscrape.com/", politeness_window=0.01)
+@dataclass
+class PageData:
+    """Represents the crawled data for a single web page."""
+    url: str
+    title: str
+    text: str
+    links: list[str] = field(default_factory=list)
+    status_code: int = 200
 
 
-# ── Unit Tests: URL normalisation ─────────────────────────────────────────────
+class Crawler:
+    """
+    Web crawler that respects a politeness window between requests.
 
-class TestNormaliseUrl:
-    def test_strips_fragment(self, crawler):
-        result = crawler._normalise_url("https://example.com/page#section")
-        assert "#section" not in result
+    Attributes:
+        base_url: The starting URL for the crawl.
+        politeness_window: Minimum seconds between HTTP requests (default 6).
+        timeout: HTTP request timeout in seconds.
+        max_retries: Number of retry attempts for failed requests.
+    """
 
-    def test_strips_trailing_slash(self, crawler):
-        result = crawler._normalise_url("https://example.com/page/")
-        assert not result.endswith("/")
+    def __init__(
+        self,
+        base_url: str = "https://quotes.toscrape.com/",
+        politeness_window: float = 6.0,
+        timeout: int = 15,
+        max_retries: int = 3,
+    ) -> None:
+        self.base_url = base_url
+        self.politeness_window = politeness_window
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self._visited: set[str] = set()
+        self._session = requests.Session()
+        self._session.headers.update(
+            {"User-Agent": "XJCO3011-SearchBot/1.0 (educational project)"}
+        )
 
-    def test_preserves_query_string(self, crawler):
-        result = crawler._normalise_url("https://example.com/search?q=test")
-        assert "q=test" in result
+    def _normalise_url(self, url: str) -> str:
+        """Strip fragments and trailing slashes for deduplication."""
+        parsed = urlparse(url)
+        normalised = parsed._replace(fragment="").geturl()
+        return normalised.rstrip("/")
 
-    def test_idempotent(self, crawler):
-        url = "https://example.com/page"
-        assert crawler._normalise_url(url) == crawler._normalise_url(crawler._normalise_url(url))
+    def _is_same_domain(self, url: str) -> bool:
+        """Return True if *url* belongs to the same domain as base_url."""
+        base_host = urlparse(self.base_url).netloc
+        target_host = urlparse(url).netloc
+        return base_host == target_host
 
+    def _fetch(self, url: str) -> Optional[requests.Response]:
+        """
+        Fetch *url* with retry logic.
 
-# ── Unit Tests: Domain filtering ──────────────────────────────────────────────
+        Returns the Response on success, or None after exhausting retries.
+        Time complexity: O(max_retries) per URL call.
+        """
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = self._session.get(url, timeout=self.timeout)
+                response.raise_for_status()
+                return response
+            except requests.exceptions.HTTPError as exc:
+                logger.warning("HTTP %s for %s (attempt %d)", exc.response.status_code, url, attempt)
+                if exc.response.status_code in (403, 404, 410):
+                    return None  # Do not retry permanent errors
+            except requests.exceptions.ConnectionError:
+                logger.warning("Connection error for %s (attempt %d/%d)", url, attempt, self.max_retries)
+            except requests.exceptions.Timeout:
+                logger.warning("Timeout for %s (attempt %d/%d)", url, attempt, self.max_retries)
+            except requests.exceptions.RequestException as exc:
+                logger.error("Request failed for %s: %s", url, exc)
+                return None
 
-class TestIsSameDomain:
-    def test_same_domain(self, crawler):
-        assert crawler._is_same_domain("https://quotes.toscrape.com/page2") is True
+            if attempt < self.max_retries:
+                backoff = self.politeness_window * attempt
+                logger.info("Backing off %.1f s before retry...", backoff)
+                time.sleep(backoff)
 
-    def test_different_domain(self, crawler):
-        assert crawler._is_same_domain("https://external.example.com/") is False
+        return None
 
-    def test_subdomain_treated_as_different(self, crawler):
-        assert crawler._is_same_domain("https://sub.quotes.toscrape.com/") is False
+    def _parse_page(self, url: str, html: str) -> PageData:
+        """
+        Extract title, visible text, and internal links from *html*.
 
+        Text extraction strips script/style nodes so only human-readable
+        content is indexed — this mirrors what a user would see in a browser.
+        Time complexity: O(n) where n = number of DOM nodes.
+        """
+        soup = BeautifulSoup(html, "html.parser")
 
-# ── Unit Tests: HTML parsing ──────────────────────────────────────────────────
+        # Title
+        title_tag = soup.find("title")
+        title = title_tag.get_text(strip=True) if title_tag else url
 
-class TestParsePage:
-    def test_extracts_title(self, crawler):
-        page = crawler._parse_page("https://quotes.toscrape.com/", SAMPLE_HTML)
-        assert page.title == "Test Page"
+        # Visible text: remove script, style, and nav boilerplate
+        for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
+            tag.decompose()
+        text = soup.get_text(separator=" ", strip=True)
 
-    def test_fallback_title_when_missing(self, crawler):
-        url = "https://quotes.toscrape.com/"
-        page = crawler._parse_page(url, SAMPLE_HTML_NO_TITLE)
-        assert page.title == url
+        # Internal links only
+        links: list[str] = []
+        for anchor in soup.find_all("a", href=True):
+            href = anchor["href"]
+            absolute = urljoin(url, href)
+            normalised = self._normalise_url(absolute)
+            if self._is_same_domain(normalised) and normalised not in self._visited:
+                links.append(normalised)
 
-    def test_extracts_visible_text(self, crawler):
-        page = crawler._parse_page("https://quotes.toscrape.com/", SAMPLE_HTML)
-        assert "Hello world" in page.text
+        return PageData(url=url, title=title, text=text, links=links)
 
-    def test_excludes_script_content(self, crawler):
-        html = "<html><body><script>var x = 'secret'</script><p>Visible</p></body></html>"
-        page = crawler._parse_page("https://quotes.toscrape.com/", html)
-        assert "secret" not in page.text
-        assert "Visible" in page.text
+    def crawl(self) -> list[PageData]:
+        """
+        BFS crawl starting from base_url.
 
-    def test_internal_links_only(self, crawler):
-        page = crawler._parse_page("https://quotes.toscrape.com/", SAMPLE_HTML)
-        assert all("quotes.toscrape.com" in link for link in page.links)
-        assert not any("external.example.com" in link for link in page.links)
+        Respects the politeness window between every HTTP request.
+        Returns a list of PageData objects, one per successfully crawled page.
 
-    def test_fragment_stripped_from_links(self, crawler):
-        page = crawler._parse_page("https://quotes.toscrape.com/", SAMPLE_HTML)
-        assert not any("#" in link for link in page.links)
+        Time complexity: O(P × (N + E)) where P = politeness_window,
+        N = number of pages, E = number of links processed.
+        Space complexity: O(N + E) for the visited set and queue.
+        """
+        pages: list[PageData] = []
+        queue: list[str] = [self._normalise_url(self.base_url)]
+        self._visited.add(queue[0])
 
-    def test_returns_page_data_instance(self, crawler):
-        page = crawler._parse_page("https://quotes.toscrape.com/", SAMPLE_HTML)
-        assert isinstance(page, PageData)
+        while queue:
+            url = queue.pop(0)
+            logger.info("Crawling: %s", url)
 
+            response = self._fetch(url)
+            if response is None:
+                logger.warning("Skipping %s (failed to fetch)", url)
+                time.sleep(self.politeness_window)
+                continue
 
-# ── Unit Tests: HTTP fetching ─────────────────────────────────────────────────
+            page = self._parse_page(url, response.text)
+            pages.append(page)
 
-class TestFetch:
-    @patch("crawler.requests.Session.get")
-    def test_successful_fetch(self, mock_get, crawler):
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.raise_for_status = MagicMock()
-        mock_get.return_value = mock_resp
+            # Enqueue newly discovered links
+            for link in page.links:
+                norm = self._normalise_url(link)
+                if norm not in self._visited:
+                    self._visited.add(norm)
+                    queue.append(norm)
 
-        result = crawler._fetch("https://quotes.toscrape.com/")
-        assert result is mock_resp
+            logger.info(
+                "  → found %d new links | total crawled: %d",
+                len(page.links),
+                len(pages),
+            )
 
-    @patch("crawler.time.sleep")
-    @patch("crawler.requests.Session.get")
-    def test_retries_on_connection_error(self, mock_get, mock_sleep, crawler):
-        import requests as req
-        mock_get.side_effect = req.exceptions.ConnectionError("refused")
-        result = crawler._fetch("https://quotes.toscrape.com/")
-        assert result is None
-        assert mock_get.call_count == crawler.max_retries
+            # Politeness: always sleep before the next request
+            if queue:
+                logger.debug("Sleeping %.1f s (politeness window)...", self.politeness_window)
+                time.sleep(self.politeness_window)
 
-    @patch("crawler.requests.Session.get")
-    def test_returns_none_on_404(self, mock_get, crawler):
-        import requests as req
-        mock_resp = MagicMock()
-        mock_resp.status_code = 404
-        http_err = req.exceptions.HTTPError(response=mock_resp)
-        mock_resp.raise_for_status.side_effect = http_err
-        mock_get.return_value = mock_resp
+        logger.info("Crawl complete. %d pages collected.", len(pages))
+        return pages
 
-        result = crawler._fetch("https://quotes.toscrape.com/missing")
-        assert result is None
-
-    @patch("crawler.time.sleep")
-    @patch("crawler.requests.Session.get")
-    def test_returns_none_on_timeout_after_retries(self, mock_get, mock_sleep, crawler):
-        import requests as req
-        mock_get.side_effect = req.exceptions.Timeout()
-        result = crawler._fetch("https://quotes.toscrape.com/")
-        assert result is None
-
-
-# ── Integration Tests: Full crawl with mocked network ────────────────────────
-
-HOME_HTML = """
-<html><head><title>Home</title></head>
-<body>
-  <p>Welcome to the quote collection.</p>
-  <a href="/page/2">Next Page</a>
-</body></html>
-"""
-
-PAGE2_HTML = """
-<html><head><title>Page 2</title></head>
-<body>
-  <p>More quotes here.</p>
-</body></html>
-"""
-
-
-class TestCrawlIntegration:
-    @patch("crawler.time.sleep")
-    @patch("crawler.requests.Session.get")
-    def test_crawls_multiple_pages(self, mock_get, mock_sleep, crawler):
-        def side_effect(url, **kwargs):
-            resp = MagicMock()
-            resp.raise_for_status = MagicMock()
-            if url.endswith("/page/2") or url.endswith("/page/2"):
-                resp.text = PAGE2_HTML
-            else:
-                resp.text = HOME_HTML
-            return resp
-
-        mock_get.side_effect = side_effect
-        pages = crawler.crawl()
-        assert len(pages) >= 1
-        assert any(p.title == "Home" for p in pages)
-
-    @patch("crawler.time.sleep")
-    @patch("crawler.requests.Session.get")
-    def test_no_duplicate_pages(self, mock_get, mock_sleep, crawler):
-        """Each URL should be visited at most once."""
-        def side_effect(url, **kwargs):
-            resp = MagicMock()
-            resp.raise_for_status = MagicMock()
-            resp.text = HOME_HTML
-            return resp
-
-        mock_get.side_effect = side_effect
-        pages = crawler.crawl()
-        urls = [p.url for p in pages]
-        assert len(urls) == len(set(urls))
-
-    @patch("crawler.time.sleep")
-    @patch("crawler.requests.Session.get")
-    def test_politeness_sleep_called(self, mock_get, mock_sleep, crawler):
-        """Verify sleep is called between requests."""
-        def side_effect(url, **kwargs):
-            resp = MagicMock()
-            resp.raise_for_status = MagicMock()
-            resp.text = HOME_HTML
-            return resp
-
-        mock_get.side_effect = side_effect
-        crawler.crawl()
-        # sleep should have been called at least once (between pages)
-        # For a single-page crawl with no outbound links, sleep is not needed
-        # We just verify it's called when there are multiple pages
-        # The assertion here is that the mock was accessible — behaviour tested
-        # explicitly in the politeness window test below.
-
-    @patch("crawler.time.sleep")
-    @patch("crawler.requests.Session.get")
-    def test_skips_failed_pages(self, mock_get, mock_sleep, crawler):
-        import requests as req
-        mock_resp_ok = MagicMock()
-        mock_resp_ok.raise_for_status = MagicMock()
-        mock_resp_ok.text = HOME_HTML
-
-        mock_resp_err = MagicMock()
-        mock_resp_err.status_code = 500
-        http_err = req.exceptions.HTTPError(response=mock_resp_err)
-        mock_resp_err.raise_for_status.side_effect = http_err
-
-        call_count = [0]
-        def side_effect(url, **kwargs):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                return mock_resp_ok
-            return mock_resp_err
-
-        mock_get.side_effect = side_effect
-        pages = crawler.crawl()
-        # Should not raise; failed pages are skipped
-        assert isinstance(pages, list)
-
-
-# ── Performance Tests ─────────────────────────────────────────────────────────
-
-class TestPerformance:
-    def test_parse_large_page_under_one_second(self, crawler):
-        """Parsing a large HTML document should complete in < 1 second."""
-        large_html = "<html><body>" + "<p>word </p>" * 10_000 + "</body></html>"
-        start = time.perf_counter()
-        crawler._parse_page("https://quotes.toscrape.com/", large_html)
-        elapsed = time.perf_counter() - start
-        assert elapsed < 1.0, f"Parsing took {elapsed:.2f}s — too slow"
+    @property
+    def visited_urls(self) -> set[str]:
+        """Return a copy of all URLs visited during the crawl."""
+        return set(self._visited)
