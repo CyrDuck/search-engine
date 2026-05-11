@@ -1,5 +1,5 @@
 """
-main.py - Basic CLI with build and load commands
+main.py - CLI with all four commands: build, load, print, find
 XJCO3011 Coursework 2
 """
 
@@ -20,7 +20,7 @@ def main():
     index_loaded = False
 
     print("XJCO3011 Search Engine - Coursework 2")
-    print("Commands: build, load, exit")
+    print("Commands: build, load, print <word>, find <query>, exit")
 
     while True:
         try:
@@ -32,10 +32,12 @@ def main():
         if not raw:
             continue
 
-        command = raw.split()[0].lower()
+        parts = raw.split(maxsplit=1)
+        command = parts[0].lower()
+        argument = parts[1] if len(parts) > 1 else ""
 
         if command == "build":
-            print(f"Crawling {BASE_URL}...")
+            print(f"Crawling {BASE_URL} (politeness window: 6s)...")
             crawler = Crawler(base_url=BASE_URL, politeness_window=6.0)
             pages = crawler.crawl()
             indexer.build(pages)
@@ -50,12 +52,35 @@ def main():
             except FileNotFoundError as e:
                 print(f"Error: {e}")
 
+        elif command == "print":
+            if not index_loaded:
+                print("No index loaded. Run 'build' or 'load' first.")
+            elif not argument:
+                print("Usage: print <word>")
+            else:
+                print(indexer.print_postings(argument.strip().lower()))
+
+        elif command == "find":
+            if not index_loaded:
+                print("No index loaded. Run 'build' or 'load' first.")
+            elif not argument:
+                print("Usage: find <word> [word ...]")
+            else:
+                results = indexer.find(argument)
+                if not results:
+                    print(f"No pages found for '{argument}'.")
+                else:
+                    print(f"Found {len(results)} page(s) for '{argument}':")
+                    for url, score in sorted(results, key=lambda x: x[1], reverse=True):
+                        title = indexer._page_titles.get(url, url)
+                        print(f"  {title}\n  URL: {url}\n  Score: {score}")
+
         elif command in ("exit", "quit"):
             print("Goodbye!")
             break
 
         else:
-            print(f"Unknown command: '{command}'. Commands: build, load, exit")
+            print(f"Unknown command: '{command}'.")
 
 
 if __name__ == "__main__":
